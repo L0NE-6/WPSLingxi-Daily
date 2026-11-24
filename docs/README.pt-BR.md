@@ -1,6 +1,7 @@
 # 🟦 WPS Lingxi Daily
 
-[简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Português (BR)](README.pt-BR.md)
+[简体中文](../README.md) · [English](README.en.md) · [繁體中文](README.zh-Hant.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · **Português (BR)**
+> Versão: **v1.0.0** (2026-11-24)
 
 Check-in diário do WPS Lingxi para várias contas em um único arquivo Python.
 
