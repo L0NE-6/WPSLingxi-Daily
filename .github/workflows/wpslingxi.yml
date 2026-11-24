@@ -1,0 +1,53 @@
+name: 🟦 WPS Lingxi Daily
+
+on:
+  schedule:
+    - cron: "31 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wpslingxi-daily
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+      WPSLINGXI_COOKIES: ${{ secrets.WPSLINGXI_COOKIES }}
+      WPSLINGXI_COOKIE: ${{ secrets.WPSLINGXI_COOKIE }}
+      WPSLINGXI_JSONL: ${{ secrets.WPSLINGXI_JSONL }}
+      WPSLINGXI_NOTIFY: ${{ secrets.WPSLINGXI_NOTIFY }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+      BARK_URL: ${{ secrets.BARK_URL }}
+      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+      WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+      WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v
+      - name: Detect account configuration
+        id: config
+        run: |
+          if [ -n "$WPSLINGXI_COOKIES$WPSLINGXI_COOKIE" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run check-in
+        if: steps.config.outputs.configured == 'true'
+        run: python wpslingxi_daily.py
+      - name: No account configured
+        if: steps.config.outputs.configured != 'true'
+        run: echo "::warning::未配置 WPSLINGXI_COOKIES/WPSLINGXI_COOKIE，跳过签到。"

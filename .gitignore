@@ -1,0 +1,9 @@
+.env
+*.log
+wpslingxi_results.jsonl
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+tmp/
+.probe/
