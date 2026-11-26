@@ -18,18 +18,6 @@ jobs:
     timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
-      WPSLINGXI_COOKIES: ${{ secrets.WPSLINGXI_COOKIES }}
-      WPSLINGXI_COOKIE: ${{ secrets.WPSLINGXI_COOKIE }}
-      WPSLINGXI_JSONL: ${{ secrets.WPSLINGXI_JSONL }}
-      WPSLINGXI_NOTIFY: ${{ secrets.WPSLINGXI_NOTIFY }}
-      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-      BARK_URL: ${{ secrets.BARK_URL }}
-      SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-      WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
-      WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
-      WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -39,15 +27,39 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - name: Detect account configuration
         id: config
+        env:
+          WPSLINGXI_COOKIES: ${{ secrets.WPSLINGXI_COOKIES }}
+          WPSLINGXI_COOKIE: ${{ secrets.WPSLINGXI_COOKIE }}
+          WPSLINGXI_COOKIECLOUD_URL: ${{ secrets.WPSLINGXI_COOKIECLOUD_URL }}
+          WPSLINGXI_COOKIECLOUD_UUID: ${{ secrets.WPSLINGXI_COOKIECLOUD_UUID }}
+          WPSLINGXI_COOKIECLOUD_PASSWORD: ${{ secrets.WPSLINGXI_COOKIECLOUD_PASSWORD }}
+          WPSLINGXI_COOKIECLOUD_PROFILES: ${{ secrets.WPSLINGXI_COOKIECLOUD_PROFILES }}
         run: |
-          if [ -n "$WPSLINGXI_COOKIES$WPSLINGXI_COOKIE" ]; then
+          if [ -n "$WPSLINGXI_COOKIES$WPSLINGXI_COOKIE$WPSLINGXI_COOKIECLOUD_PROFILES$WPSLINGXI_COOKIECLOUD_URL$WPSLINGXI_COOKIECLOUD_UUID$WPSLINGXI_COOKIECLOUD_PASSWORD" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Run check-in
         if: steps.config.outputs.configured == 'true'
+        env:
+          WPSLINGXI_COOKIES: ${{ secrets.WPSLINGXI_COOKIES }}
+          WPSLINGXI_COOKIE: ${{ secrets.WPSLINGXI_COOKIE }}
+          WPSLINGXI_COOKIECLOUD_URL: ${{ secrets.WPSLINGXI_COOKIECLOUD_URL }}
+          WPSLINGXI_COOKIECLOUD_UUID: ${{ secrets.WPSLINGXI_COOKIECLOUD_UUID }}
+          WPSLINGXI_COOKIECLOUD_PASSWORD: ${{ secrets.WPSLINGXI_COOKIECLOUD_PASSWORD }}
+          WPSLINGXI_COOKIECLOUD_PROFILES: ${{ secrets.WPSLINGXI_COOKIECLOUD_PROFILES }}
+          WPSLINGXI_JSONL: ${{ secrets.WPSLINGXI_JSONL }}
+          WPSLINGXI_NOTIFY: ${{ secrets.WPSLINGXI_NOTIFY }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
         run: python wpslingxi_daily.py
       - name: No account configured
         if: steps.config.outputs.configured != 'true'
-        run: echo "::warning::未配置 WPSLINGXI_COOKIES/WPSLINGXI_COOKIE，跳过签到。"
+        run: echo "::warning::未配置静态 Cookie 或 CookieCloud，跳过签到。"

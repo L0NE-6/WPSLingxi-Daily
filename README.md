@@ -4,9 +4,9 @@
 
 # WPS Lingxi Daily
 
-**WPS 灵犀每日签到 · 双域回退 · 任务与余额双回读**
+**WPS 灵犀每日签到 · CookieCloud 同步 · 双域回退 · 任务与余额双回读**
 
-> 当前版本：**v1.0.0**（2026-11-24） · daily_check_in 任务按日期领取，主域失败仅做有界回退
+> 当前版本：**v1.0.1**（2026-11-26） · 支持 CookieCloud 单账号与多账号配置，静态 Cookie 优先并按 `wps_sid` 去重
 
 [简体中文](README.md) · [English](docs/README.en.md) · [繁體中文](docs/README.zh-Hant.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md) · [Português (BR)](docs/README.pt-BR.md)
 
@@ -16,8 +16,9 @@
 <img src="https://img.shields.io/badge/Python-3.8%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
 <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20Qinglong-4EAA25?style=for-the-badge&logo=linux&logoColor=white" alt="Platform" />
 <img src="https://img.shields.io/badge/License-MIT-F472B6?style=for-the-badge" alt="License" />
+<img src="https://img.shields.io/badge/CookieCloud-PyCookieCloud%201.0.4-00A67E?style=for-the-badge" alt="CookieCloud" />
 
-🔐 Cookie 隔离 · 🌐 wps.cn / kdocs.cn · 🎯 daily_check_in · ✅ 任务与余额回读 · 🧾 JSONL · ☁️ Actions
+🔐 CookieCloud · 🌐 wps.cn / kdocs.cn · 🎯 daily_check_in · ✅ 任务与余额回读 · 🧾 JSONL · ☁️ Actions
 
 [⚡ 30 秒速览](#quick-look) · [🔁 协议与回读](#protocol) · [🔐 凭据](#credentials) · [🐧 青龙](#qinglong) · [☁️ Actions](#actions) · [⌨️ CLI](#cli-json) · [✅ 成功判据](#success) · [✦ 星轨](#star-trail)
 
@@ -43,11 +44,11 @@
 | 维度 | 说明 |
 | :--- | :--- |
 | **做什么** | 执行 WPS 灵犀每日签到，领取 `daily_check_in` 奖励并核对余额。 |
-| **输入** | `WPSLINGXI_COOKIES`，每行 `备注\|wps_sid\|uid` 或完整 Cookie。 |
+| **输入** | 静态 `WPSLINGXI_COOKIES`，或 CookieCloud 单账号 / 多账号变量。 |
 | **流程** | 任务列表找 `daily_check_in` → 选择日期 → claim → 回读任务 → 回读余额。 |
 | **成功判据** | claim 后任务状态为 `claimed`，并成功读取签到后余额。 |
 | **输出** | 中文汇总 + 可选推送 + 每账号一行 JSONL。 |
-| **依赖** | Python 3.8+，仅 `requests`。 |
+| **依赖** | Python 3.8+、`requests`、`PyCookieCloud==1.0.4`。 |
 
 ---
 
@@ -58,6 +59,9 @@ WPS 灵犀脚本从任务中心读取 `daily_check_in`，根据 `extra.check_in_
 ### 覆盖范围
 
 - `备注|wps_sid|uid` 与完整 Cookie 两种账号形式。
+- CookieCloud 单账号变量与 `备注|URL|UUID|密码` 多账号列表。
+- CookieCloud 仅从同一 WPS 域名提取 `wps_sid` 与可选 `uid`；静态 Cookie 优先，按 `wps_sid` 去重。
+- 单个 CookieCloud 配置失败只影响对应账号，不阻断静态 Cookie 和其他有效配置；单次拉取最长等待 30 秒。
 - 主域 `lingxi.wps.cn`，遇到 401/403、`UserUnauthorized` 或主域不存在时回退 `lingxi.kdocs.cn`。
 - `task_key=daily_check_in` 任务发现。
 - `status=claimed` 回读和 `total_balance` / `balance` 余额回读。
@@ -103,10 +107,33 @@ GET  /api/public/v1/credits/balance
 备号|wps_sid=xxx; uid=123456
 ```
 
+### CookieCloud
+
+单账号：
+
+```text
+WPSLINGXI_COOKIECLOUD_URL=https://cookie.example
+WPSLINGXI_COOKIECLOUD_UUID=your-uuid
+WPSLINGXI_COOKIECLOUD_PASSWORD=your-password
+```
+
+多账号 `WPSLINGXI_COOKIECLOUD_PROFILES`，每行一个：
+
+```text
+主号|https://cookie.example|uuid-1|password-1
+备号|http://127.0.0.1:8088|uuid-2|password-2
+```
+
+CookieCloud 域名优先级为 `lingxi.wps.cn` → `wps.cn` / 其他 `wps.cn` 子域 → `lingxi.kdocs.cn` → `kdocs.cn` / 其他 `kdocs.cn` 子域。`wps_sid` 与 `uid` 必须来自同一域名，避免拼出不匹配的会话；单次拉取超过 30 秒按该账号失败处理。静态 Cookie 优先，并按 `wps_sid` 去重。CookieCloud 的 URL、UUID、密码和完整 Cookie 不会写入 JSONL。
+
 | 变量 | 必填 | 说明 |
 | :--- | :---: | :--- |
-| `WPSLINGXI_COOKIES` | 二选一 | 多账号 Cookie。 |
-| `WPSLINGXI_COOKIE` | 二选一 | 单账号 Cookie。 |
+| `WPSLINGXI_COOKIES` | 至少一种 | 多账号静态 Cookie。 |
+| `WPSLINGXI_COOKIE` | 至少一种 | 单账号静态 Cookie。 |
+| `WPSLINGXI_COOKIECLOUD_URL` | 单账号云同步 | CookieCloud 服务 URL。 |
+| `WPSLINGXI_COOKIECLOUD_UUID` | 单账号云同步 | CookieCloud UUID。 |
+| `WPSLINGXI_COOKIECLOUD_PASSWORD` | 单账号云同步 | CookieCloud 密码。 |
+| `WPSLINGXI_COOKIECLOUD_PROFILES` | 多账号云同步 | 每行 `备注\|URL\|UUID\|密码`，密码可包含 `\|`；与单账号三变量二选一或混用。 |
 | `WPSLINGXI_JSONL` | 否 | JSONL 路径，默认 `wpslingxi_results.jsonl`。 |
 | `WPSLINGXI_NOTIFY` | 否 | `always` / `fail` / `0`。 |
 | `PUSHPLUS_TOKEN` / `BARK_URL` | 否 | 推送。 |
@@ -127,6 +154,15 @@ $env:WPSLINGXI_COOKIE = "wps_sid=xxx; uid=123456"
 python wpslingxi_daily.py
 ```
 
+CookieCloud 单账号：
+
+```powershell
+$env:WPSLINGXI_COOKIECLOUD_URL = "https://cookie.example"
+$env:WPSLINGXI_COOKIECLOUD_UUID = "your-uuid"
+$env:WPSLINGXI_COOKIECLOUD_PASSWORD = "your-password"
+python wpslingxi_daily.py
+```
+
 ### Bash
 
 ```bash
@@ -142,9 +178,9 @@ python wpslingxi_daily.py
 <a id="qinglong"></a>
 ## 🐧 青龙
 
-1. 在青龙依赖管理中安装 `requests`，或执行 `pip3 install -r requirements.txt`。
+1. 在青龙依赖管理中安装 `requests` 与 `PyCookieCloud==1.0.4`，或执行 `pip3 install -r requirements.txt`。
 2. 上传 `wpslingxi_daily.py` 到脚本目录。
-3. 在环境变量中配置 `WPSLINGXI_COOKIES` 或 `WPSLINGXI_COOKIE`。
+3. 配置静态 Cookie，或配置 CookieCloud 单账号 / 多账号变量。
 4. 新建定时任务，命令使用 `task wpslingxi_daily.py`，不要直接写裸 `python`。
 5. 建议北京时间：`31 7 * * *`。青龙按面板本地时间执行。
 
@@ -172,6 +208,8 @@ task wpslingxi_daily.py
 | :--- | :--- |
 | `WPSLINGXI_COOKIES` | 多账号 Cookie。 |
 | `WPSLINGXI_COOKIE` | 单账号 Cookie。 |
+| `WPSLINGXI_COOKIECLOUD_URL` / `WPSLINGXI_COOKIECLOUD_UUID` / `WPSLINGXI_COOKIECLOUD_PASSWORD` | CookieCloud 单账号三变量。 |
+| `WPSLINGXI_COOKIECLOUD_PROFILES` | CookieCloud 多账号一行配置，每行 `备注\|URL\|UUID\|密码`。 |
 | `WPSLINGXI_JSONL` / `WPSLINGXI_NOTIFY` | 输出路径与推送策略。 |
 | `PUSHPLUS_TOKEN` / `BARK_URL` / `SERVERCHAN_SENDKEY` | 推送。 |
 | `WXPUSHER_APP_TOKEN` / `WXPUSHER_UID` | WxPusher。 |
@@ -240,7 +278,7 @@ python -m compileall -q wpslingxi_daily.py tests
 python -m ruff check .
 ```
 
-离线测试覆盖 Cookie/UID 解析、完整签到、日期选择、双域回退、任务回读、余额变化和 JSONL 不含 Cookie。
+离线测试覆盖 Cookie/UID 解析、CookieCloud 单账号与多账号解析、WPS 域名优先级、同域字段配对、30 秒超时、单配置故障隔离、按 `wps_sid` 去重、凭据与 JSONL 脱敏、推送异常脱敏、完整签到、日期选择、双域回退、任务回读和余额变化。测试工作流使用 Python 3.8 与 3.11 双版本矩阵。
 
 ---
 
@@ -250,13 +288,15 @@ python -m ruff check .
 - **日期来自服务端**：优先选择当天或 `available` 日期。
 - **双域有界**：只在鉴权失败或主域不存在时回退。
 - **任务与余额双读**：claim 回执不是最终成功。
-- **Cookie 脱敏**：JSONL 不含 `wps_sid` 或 uid。
+- **CookieCloud 有界提取**：同一 WPS 域名内读取 `wps_sid` 与 `uid`，单次拉取 30 秒上限。
+- **故障隔离**：单个 CookieCloud 配置失败只标记该账号，不阻断其他账号。
+- **Cookie 脱敏**：JSONL 对敏感键递归脱敏，不写 `wps_sid`、uid、UUID 或密码。
 
 ---
 
 ## 🔒 隐私
 
-仓库不包含 Cookie、`wps_sid`、UID、账号、手机号、日志或真实响应。`wpslingxi_results.jsonl`、`.env`、日志和缓存已由 `.gitignore` 排除。
+仓库不包含 Cookie、`wps_sid`、UID、CookieCloud UUID、密码、账号、手机号、日志或真实响应。`wpslingxi_results.jsonl`、`.env`、日志和缓存已由 `.gitignore` 排除。
 
 ---
 
@@ -290,7 +330,7 @@ WPSLingxi-Daily/
 
 ## 📦 版本与发布
 
-- 当前清单版本：`v1.0.0`，日期 `2026-11-24`。
+- 当前清单版本：`v1.0.1`，日期 `2026-11-26`。
 - 脚本版本与 `wpslingxi_daily.py` 内的 `VERSION` 保持一致。
 - 更新记录见 [CHANGELOG.md](CHANGELOG.md)，下载入口见 [Releases](https://github.com/L0NE-6/WPSLingxi-Daily/releases)。
 - Release 徽标由 GitHub 实时生成；如果页面尚未创建对应 Release，以 `CHANGELOG.md` 和仓库提交为准。

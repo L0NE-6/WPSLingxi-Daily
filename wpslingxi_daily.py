@@ -9,26 +9,51 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 PRIMARY_BASE = "https://lingxi.wps.cn"
 FALLBACK_BASE = "https://lingxi.kdocs.cn"
 TASKS_PATH = "/api/public/v1/tasks"
 BALANCE_PATH = "/api/public/v1/credits/balance"
 CHECKIN_KEY = "daily_check_in"
 DEFAULT_TIMEOUT = 20
+COOKIECLOUD_TIMEOUT = 30
 BEIJING = timezone(timedelta(hours=8))
 
-_SECRET_RE = re.compile(r"(?i)(cookie|wps_sid|authorization|token)(\s*[:=]\s*)([^\s;,]+)")
+_SECRET_RE = re.compile(
+    r"(?i)(cookie|wps_sid|authorization|token|uuid|password)(\s*[:=]\s*)([^\s;,]+)"
+)
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization)(\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"
+)
+_COOKIE_HEADER_RE = re.compile(r"(?i)\b(cookie|set-cookie)(\s*[:=]\s*)[^\r\n]+")
+_COOKIE_PAIR_RE = re.compile(
+    r"(?i)\b("
+    r"api[_-]?key|access[_-]?token|refresh[_-]?token|wps_sid|uid|token|"
+    r"uuid|password|key|session|csrf|jwt"
+    r")=([^;\s&]+)"
+)
+_URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>]+")
+_UUID_RE = re.compile(
+    r"(?i)\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})\b"
+)
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(^|[_-])("
+    r"cookie|wps_sid|authorization|token|uuid|password|secret|webhook|bark|"
+    r"uid|session|csrf|jwt|api[_-]?key"
+    r")($|[_-])"
+)
 
 
 class WpsError(Exception):
@@ -60,10 +85,27 @@ class ApiError(WpsError):
         self.code = code
 
 
+class CookieCloudError(ValueError):
+    pass
+
+
+class CookieCloudDependencyError(CookieCloudError):
+    pass
+
+
 @dataclass(frozen=True)
 class Account:
     label: str
     cookie: str
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class CookieCloudProfile:
+    label: str
+    url: str = field(repr=False)
+    uuid: str = field(repr=False)
+    password: str = field(repr=False)
 
 
 @dataclass
@@ -92,9 +134,45 @@ def _configure_stdio() -> None:
 
 
 def _sanitize(text: Any, limit: int = 300) -> str:
-    value = str(text).replace("\r", " ").replace("\n", " ").strip()
+    value = _COOKIE_HEADER_RE.sub(r"\1\2[redacted]", str(text))
+    value = value.replace("\r", " ").replace("\n", " ").strip()
+    value = _AUTH_HEADER_RE.sub(r"\1\2[redacted]", value)
     value = _SECRET_RE.sub(r"\1\2[redacted]", value)
+    value = _COOKIE_PAIR_RE.sub(r"\1=[redacted]", value)
+    value = _URL_RE.sub("[redacted-url]", value)
+    value = _UUID_RE.sub("[redacted-uuid]", value)
     return value[:limit]
+
+
+def _sanitize_label(label: Any) -> str:
+    raw = str(label)
+    if "://" in raw or re.search(r"(?i)\buuid\b", raw):
+        return "[redacted-label]"
+    return _sanitize(raw, limit=80)
+
+
+def _sanitize_detail(value: Any) -> Any:
+    if isinstance(value, dict):
+        name = value.get("name")
+        redact_value = isinstance(name, str) and bool(_SENSITIVE_KEY_RE.search(name))
+        return {
+            str(key): (
+                "[redacted]"
+                if _SENSITIVE_KEY_RE.search(str(key))
+                or (redact_value and str(key).lower() == "value")
+                else _sanitize_detail(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_detail(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_detail(item) for item in value]
+    if isinstance(value, str):
+        return _sanitize(value, limit=2000)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _sanitize(value, limit=2000)
 
 
 def _split_entries(raw: str) -> List[str]:
@@ -109,7 +187,7 @@ def _normalize_cookie(value: str) -> str:
         text = text[7:].strip()
     if not text or len(text) > 8192 or any(ord(char) < 32 or ord(char) == 127 for char in text):
         raise ValueError("invalid cookie")
-    if "wps_sid=" not in text:
+    if not re.search(r"(?i)(?:^|;\s*)wps_sid\s*=", text):
         if ";" in text:
             raise ValueError("cookie must contain wps_sid")
         text = "wps_sid=" + text
@@ -138,9 +216,304 @@ def parse_accounts(raw: str) -> List[Account]:
     return accounts
 
 
-def load_accounts() -> List[Account]:
+def parse_cookiecloud_profiles(
+    raw: Optional[str] = None,
+    *,
+    errors: Optional[List[Tuple[str, str]]] = None,
+) -> List[CookieCloudProfile]:
+    profiles: List[CookieCloudProfile] = []
+    text = _env("WPSLINGXI_COOKIECLOUD_PROFILES") if raw is None else raw
+
+    def report(label: str, message: str) -> None:
+        if errors is None:
+            raise CookieCloudError(message)
+        errors.append((label, message))
+
+    for index, line in enumerate(text.splitlines(), 1):
+        entry = line.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        parts = [part.strip() for part in entry.split("|", 3)]
+        if len(parts) != 4 or not all(parts):
+            report(
+                f"CookieCloud-{index}",
+                f"CookieCloud 第 {index} 行格式错误，应为 备注|URL|UUID|密码",
+            )
+            continue
+        label, url, uuid, password = parts
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            report(label, f"{label}: CookieCloud URL 无效")
+            continue
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            report(label, f"{label}: CookieCloud URL 无效")
+            continue
+        if parsed.username or parsed.password:
+            report(label, f"{label}: CookieCloud URL 不能包含内嵌凭据")
+            continue
+        profiles.append(
+            CookieCloudProfile(label=label, url=url, uuid=uuid, password=password)
+        )
+
+    if raw is None:
+        single = {
+            "url": _env("WPSLINGXI_COOKIECLOUD_URL"),
+            "uuid": _env("WPSLINGXI_COOKIECLOUD_UUID"),
+            "password": _env("WPSLINGXI_COOKIECLOUD_PASSWORD"),
+        }
+        configured = [bool(value) for value in single.values()]
+        if any(configured) and not all(configured):
+            report(
+                "CookieCloud",
+                "CookieCloud 单账号配置不完整，需要同时设置 URL、UUID 和 PASSWORD",
+            )
+        elif all(configured):
+            try:
+                parsed = urllib.parse.urlsplit(single["url"])
+            except ValueError:
+                report("CookieCloud", "CookieCloud URL 无效")
+                parsed = None
+            if parsed is not None and (
+                parsed.scheme not in ("http", "https") or not parsed.netloc
+            ):
+                report("CookieCloud", "CookieCloud URL 无效")
+            elif parsed is not None and (parsed.username or parsed.password):
+                report("CookieCloud", "CookieCloud URL 不能包含内嵌凭据")
+            elif parsed is not None:
+                profiles.append(
+                    CookieCloudProfile(
+                        label="CookieCloud",
+                        url=single["url"],
+                        uuid=single["uuid"],
+                        password=single["password"],
+                    )
+                )
+    return profiles
+
+
+def _default_cookiecloud_factory(url: str, uuid: str, password: str) -> Any:
+    try:
+        from PyCookieCloud import PyCookieCloud
+    except ImportError as exc:
+        raise CookieCloudDependencyError(
+            "未安装 PyCookieCloud，请先执行 pip install -r requirements.txt"
+        ) from exc
+    return PyCookieCloud(url, uuid, password)
+
+
+def _cookiecloud_domain_score(domain: str) -> int:
+    value = domain.strip().lower()
+    if "://" in value:
+        try:
+            host = urllib.parse.urlsplit(value).hostname or ""
+        except ValueError:
+            return 0
+    else:
+        host = value.lstrip(".").split("/", 1)[0].split(":", 1)[0]
+    if host == "lingxi.wps.cn":
+        return 100
+    if host == "wps.cn":
+        return 90
+    if host.endswith(".wps.cn"):
+        return 80
+    if host == "lingxi.kdocs.cn":
+        return 70
+    if host == "kdocs.cn":
+        return 60
+    if host.endswith(".kdocs.cn"):
+        return 50
+    return 0
+
+
+def _safe_cookie_value(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list, tuple)):
+        return None
+    text = str(value)
+    if not text or len(text) > 4096:
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 or char == ";" for char in text):
+        return None
+    return text
+
+
+def _fetch_cookiecloud_data(client: Any) -> Any:
+    result: queue.Queue[Any] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result.put(("ok", client.get_decrypted_data()))
+        except Exception as exc:
+            result.put(("error", exc))
+
+    thread = threading.Thread(target=worker, name="cookiecloud-fetch", daemon=True)
+    thread.start()
+    try:
+        status, payload = result.get(timeout=COOKIECLOUD_TIMEOUT)
+    except queue.Empty:
+        raise CookieCloudError(
+            f"CookieCloud 拉取超时（超过 {COOKIECLOUD_TIMEOUT} 秒）"
+        ) from None
+    if status == "error":
+        raise payload
+    return payload
+
+
+def extract_cookiecloud_cookie(
+    cookie_data: Mapping[str, Any],
+    *,
+    label: str,
+) -> str:
+    domains = sorted(
+        (
+            (domain, _cookiecloud_domain_score(domain))
+            for domain in cookie_data
+            if isinstance(domain, str)
+        ),
+        key=lambda item: (-item[1], item[0].lower()),
+    )
+    for domain, score in domains:
+        if score <= 0:
+            continue
+        items = cookie_data.get(domain)
+        if not isinstance(items, list):
+            continue
+        groups: Dict[Tuple[str, str], Dict[str, str]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").lower()
+            if name not in ("wps_sid", "uid"):
+                continue
+            value = _safe_cookie_value(item.get("value"))
+            if not value:
+                continue
+            item_domain = str(item.get("domain") or domain).strip().lower()
+            item_path = str(item.get("path") or "/").strip() or "/"
+            groups.setdefault((item_domain, item_path), {})[name] = value
+        candidates = [
+            (group, values)
+            for group, values in groups.items()
+            if "wps_sid" in values
+        ]
+        candidates.sort(
+            key=lambda item: (
+                0 if "uid" in item[1] else 1,
+                0 if item[0][1] == "/" else 1,
+                0
+                if item[0][0].lstrip(".") == domain.lstrip(".").lower()
+                else 1,
+                len(item[0][1]),
+                item[0][0],
+                item[0][1],
+            )
+        )
+        if candidates:
+            values = candidates[0][1]
+            cookie = f"wps_sid={values['wps_sid']}"
+            if "uid" in values:
+                cookie += f"; uid={values['uid']}"
+            return cookie
+    raise CookieCloudError(f"{label}: CookieCloud 中没有可用的 wps_sid")
+
+
+def load_cookiecloud_accounts(
+    profiles: Optional[Sequence[CookieCloudProfile]] = None,
+    *,
+    factory: Optional[Callable[[str, str, str], Any]] = None,
+) -> List[Account]:
+    parse_errors: List[Tuple[str, str]] = []
+    profiles = (
+        list(profiles)
+        if profiles is not None
+        else parse_cookiecloud_profiles(errors=parse_errors)
+    )
+    accounts: List[Account] = [
+        Account(label=_sanitize_label(label), cookie="", error=_sanitize(message))
+        for label, message in parse_errors
+    ]
+    if not profiles:
+        return accounts
+    client_factory = factory or _default_cookiecloud_factory
+    for profile in profiles:
+        safe_label = _sanitize_label(profile.label)
+        try:
+            client = client_factory(profile.url, profile.uuid, profile.password)
+            cookie_data = _fetch_cookiecloud_data(client)
+        except CookieCloudDependencyError as exc:
+            accounts.append(
+                Account(label=safe_label, cookie="", error=_sanitize(exc))
+            )
+            continue
+        except CookieCloudError as exc:
+            accounts.append(
+                Account(label=safe_label, cookie="", error=_sanitize(exc))
+            )
+            continue
+        except Exception as exc:
+            accounts.append(
+                Account(
+                    label=safe_label,
+                    cookie="",
+                    error=(
+                        f"{safe_label}: CookieCloud 拉取或解密失败"
+                        f"（{type(exc).__name__}）"
+                    ),
+                )
+            )
+            continue
+        if not isinstance(cookie_data, dict):
+            accounts.append(
+                Account(
+                    label=safe_label,
+                    cookie="",
+                    error=f"{safe_label}: CookieCloud 未返回可用的 cookie_data",
+                )
+            )
+            continue
+        try:
+            cookie = extract_cookiecloud_cookie(cookie_data, label=safe_label)
+        except CookieCloudError as exc:
+            accounts.append(
+                Account(
+                    label=safe_label,
+                    cookie="",
+                    error=_sanitize(exc),
+                )
+            )
+            continue
+        accounts.append(Account(label=profile.label, cookie=cookie))
+    return accounts
+
+
+def _account_identity(account: Account) -> str:
+    for part in account.cookie.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name.strip().lower() == "wps_sid" and value.strip():
+            return "wps_sid=" + value.strip()
+    return account.cookie
+
+
+def load_accounts(
+    *,
+    cookiecloud_factory: Optional[Callable[[str, str, str], Any]] = None,
+) -> List[Account]:
     raw = _env("WPSLINGXI_COOKIES") or _env("WPSLINGXI_COOKIE")
-    return parse_accounts(raw) if raw else []
+    accounts = parse_accounts(raw) if raw else []
+    accounts.extend(load_cookiecloud_accounts(factory=cookiecloud_factory))
+
+    unique: List[Account] = []
+    seen = set()
+    for account in accounts:
+        if account.error:
+            unique.append(account)
+            continue
+        identity = _account_identity(account)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(account)
+    return unique
 
 
 def make_session(account: Account) -> requests.Session:
@@ -321,6 +694,8 @@ def run_account(
     *,
     session: Optional[requests.Session] = None,
 ) -> AccountResult:
+    if account.error:
+        raise AuthError(account.error)
     owns_session = session is None
     session = session or make_session(account)
     try:
@@ -345,12 +720,12 @@ def append_jsonl(path: str, result: AccountResult) -> None:
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "provider": "wps-lingxi",
-        "label": result.account.label,
+        "label": _sanitize_label(result.account.label),
         "outcome": result.outcome,
         "ok": result.ok,
         "credit": result.credit,
         "message": _sanitize(result.message),
-        "detail": result.detail,
+        "detail": _sanitize_detail(result.detail),
     }
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
@@ -363,9 +738,11 @@ def format_summary(results: Sequence[AccountResult]) -> str:
     lines = [f"🟦 WPS Lingxi Daily v{VERSION}", f"账号数: {len(results)}"]
     for result in results:
         icon = "✅" if result.ok else "❌"
+        label = _sanitize_label(result.account.label)
+        message = _sanitize(result.message)
         lines.append(
-            f"{icon} {result.account.label} · {result.outcome} · "
-            f"{result.message} · credit={result.credit:g}"
+            f"{icon} {label} · {result.outcome} · "
+            f"{message} · credit={result.credit:g}"
         )
     lines.append(f"结果: {sum(1 for item in results if item.ok)}/{len(results)} 成功")
     return "\n".join(lines)
@@ -386,7 +763,7 @@ def _post(url: str, **kwargs: Any) -> None:
         if response.status_code >= 400:
             print(f"⚠️ 推送失败 HTTP {response.status_code}", file=sys.stderr)
     except requests.RequestException as exc:
-        print(f"⚠️ 推送异常：{_sanitize(exc)}", file=sys.stderr)
+        print(f"⚠️ 推送异常：{type(exc).__name__}", file=sys.stderr)
 
 
 def notify(text: str, results: Sequence[AccountResult]) -> None:
@@ -463,20 +840,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 2
         accounts = [accounts[args.only - 1]]
     if not accounts:
-        print("❌ 未配置 WPSLINGXI_COOKIES 或 WPSLINGXI_COOKIE", file=sys.stderr)
+        print(
+            "❌ 未配置静态 Cookie 或 WPSLINGXI_COOKIECLOUD_*",
+            file=sys.stderr,
+        )
         return 2
 
     results: List[AccountResult] = []
     for account in accounts:
-        try:
-            result = run_account(account)
-        except Exception as exc:
+        if account.error:
             result = AccountResult(
                 account=account,
                 ok=False,
                 outcome="failed",
-                message=_sanitize(exc),
+                message=_sanitize(account.error),
             )
+        else:
+            try:
+                result = run_account(account)
+            except Exception as exc:
+                result = AccountResult(
+                    account=account,
+                    ok=False,
+                    outcome="failed",
+                    message=_sanitize(exc),
+                )
         results.append(result)
         append_jsonl(args.jsonl, result)
 

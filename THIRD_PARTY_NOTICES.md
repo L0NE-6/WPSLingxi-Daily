@@ -22,6 +22,10 @@ verbatim into this repository; the protocol behavior is reimplemented in Python.
 `requests` is used under the Apache License 2.0. See the installed package's
 license metadata and distribution for the full text.
 
+`PyCookieCloud==1.0.4` is used under the MIT License for CookieCloud transport
+and decryption. See the installed package metadata and distribution for the
+full license text.
+
 ## Trademarks
 
 WPS, WPS Lingxi, Kingsoft, and related service names or logos are trademarks or
